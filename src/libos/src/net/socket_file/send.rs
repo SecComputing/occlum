@@ -1,21 +1,28 @@
 use super::*;
 
 impl SocketFile {
-    // TODO: need sockaddr type to implement send/sento
-    /*
-    pub fn send(&self, buf: &[u8], flags: MsgFlags) -> Result<usize> {
+    pub fn send(&self, buf: &[u8], flags: SendFlags) -> Result<usize> {
         self.sendto(buf, flags, None)
     }
 
-    pub fn sendto(&self, buf: &[u8], flags: MsgFlags, dest_addr: Option<&[u8]>) -> Result<usize> {
-        Self::do_sendmsg(
-            self.host_fd,
-            &buf[..],
-            flags,
-            dest_addr,
-            None)
+    // TODO: use sendmsg to impl sendto
+    pub fn sendto(&self, buf: &[u8], flags: SendFlags, addr: Option<SockAddr>) -> Result<usize> {
+        let (addr_ptr, addr_len) = if let Some(addr_in) = addr {
+            addr_in.as_ptr_and_len()
+        } else {
+            (std::ptr::null(), 0)
+        };
+
+        let ret = try_libc!(libc::ocall::sendto(
+            self.host_fd(),
+            buf.as_ptr() as *mut c_void,
+            buf.len(),
+            flags.bits(),
+            addr_ptr as *const _,
+            addr_len as libc::socklen_t
+        ));
+        Ok(ret as usize)
     }
-    */
 
     pub fn sendmsg<'a, 'b>(&self, msg: &'b MsgHdr<'a>, flags: SendFlags) -> Result<usize> {
         // Copy message's iovecs into untrusted iovecs
@@ -45,7 +52,7 @@ impl SocketFile {
         // Prepare the arguments for OCall
         let mut retval: isize = 0;
         // Host socket fd
-        let host_fd = self.host_fd;
+        let host_fd = self.host_fd();
         // Name
         let (msg_name, msg_namelen) = name.as_ptr_and_len();
         let msg_name = msg_name as *const c_void;

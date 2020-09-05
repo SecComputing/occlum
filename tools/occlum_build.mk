@@ -55,6 +55,11 @@ define get_conf_entry_points
 		python -c "import sys, json; print json.dumps(json.load(sys.stdin)['entry_points'])"
 endef
 
+define get_conf_networking
+	cat "$(JSON_CONF)" | \
+		python -c "import sys, json; print json.dumps(json.load(sys.stdin)['networking'])"
+endef
+
 define get_occlum_conf_file_mac
 	LD_LIBRARY_PATH="$(SGX_SDK)/sdk_libs" \
 		"$(occlum_dir)/build/bin/occlum-protect-integrity" show-mac "$(instance_dir)/build/Occlum.json.protected"
@@ -104,6 +109,7 @@ $(instance_dir)/build/Occlum.json: $(SECURE_IMAGE) $(JSON_CONF) | $(instance_dir
 		export OCCLUM_CONF_DEFAULT_MMAP_SIZE=`$(get_conf_default_mmap_size)` ; \
 		export OCCLUM_CONF_ENV="`$(get_conf_env)`" ; \
 		export OCCLUM_CONF_ENTRY_POINTS=`$(get_conf_entry_points)` ; \
+		export OCCLUM_CONF_NET=`$(get_conf_networking)` ; \
 		cd "$(instance_dir)/build" ; \
 		"$(occlum_dir)/build/bin/occlum-gen-default-occlum-json" > "Occlum.json"
 

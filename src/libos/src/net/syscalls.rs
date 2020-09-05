@@ -9,24 +9,61 @@ use time::timeval_t;
 use util::mem_util::from_user;
 
 pub fn do_socket(domain: c_int, socket_type: c_int, protocol: c_int) -> Result<isize> {
-    debug!(
-        "socket: domain: {}, socket_type: 0x{:x}, protocol: {}",
-        domain, socket_type, protocol
-    );
+    let domain = ProtocolFamily::try_from(domain as u16)?;
+    let file_flags = FileFlags::from_bits_truncate(socket_type);
+    let sock_type = SocketType::try_from(socket_type & (!file_flags.bits()))?;
 
     let file_ref: Arc<Box<dyn File>> = match domain {
-        libc::AF_LOCAL => {
-            let unix_socket = UnixSocketFile::new(socket_type, protocol)?;
+        ProtocolFamily::PF_LOCAL => {
+            let unix_socket = UnixSocket::new(sock_type, file_flags, protocol)?;
             Arc::new(Box::new(unix_socket))
         }
         _ => {
-            let socket = SocketFile::new(domain, socket_type, protocol)?;
+            let socket = SocketFile::new(domain, sock_type, file_flags, protocol)?;
             Arc::new(Box::new(socket))
         }
     };
 
-    let fd = current!().add_file(file_ref, false);
+    let close_on_spawn = file_flags.contains(FileFlags::SOCK_CLOEXEC);
+    let fd = current!().add_file(file_ref, close_on_spawn);
     Ok(fd as isize)
+}
+
+pub fn do_bind(fd: c_int, addr: *const libc::sockaddr, addr_len: libc::socklen_t) -> Result<isize> {
+    if addr.is_null() || addr_len == 0 {
+        return_errno!(EINVAL, "no address is specified");
+    }
+    from_user::check_array(addr as *const u8, addr_len as usize)?;
+
+    let addr_option = unsafe { SockAddr::try_from_raw(addr, addr_len)? };
+    if addr_option.is_none() {
+        return_errno!(EINVAL, "the address is unspecified");
+    }
+    trace!("bind to addr: {:?}", addr_option);
+
+    let file_ref = current!().file(fd as FileDesc)?;
+    if let Ok(socket) = file_ref.as_socket() {
+        socket.bind(addr_option.unwrap())?;
+    } else if let Ok(unix_socket) = file_ref.as_unix_socket() {
+        unix_socket.bind(addr_option.unwrap())?;
+    } else {
+        return_errno!(EBADF, "not a socket");
+    }
+
+    Ok(0)
+}
+
+pub fn do_listen(fd: c_int, backlog: c_int) -> Result<isize> {
+    let file_ref = current!().file(fd as FileDesc)?;
+    if let Ok(socket) = file_ref.as_socket() {
+        socket.listen(backlog)?;
+    } else if let Ok(unix_socket) = file_ref.as_unix_socket() {
+        unix_socket.listen(backlog)?;
+    } else {
+        return_errno!(EBADF, "not a socket");
+    }
+
+    Ok(0)
 }
 
 pub fn do_connect(
@@ -34,10 +71,6 @@ pub fn do_connect(
     addr: *const libc::sockaddr,
     addr_len: libc::socklen_t,
 ) -> Result<isize> {
-    debug!(
-        "connect: fd: {}, addr: {:?}, addr_len: {}",
-        fd, addr, addr_len
-    );
     // For SOCK_DGRAM sockets not initiated in connection-mode,
     // if address is a null address for the protocol,
     // the socket's peer address shall be reset.
@@ -46,24 +79,22 @@ pub fn do_connect(
         from_user::check_array(addr as *const u8, addr_len as usize)?;
     }
 
+    let addr_option = if need_check {
+        unsafe { SockAddr::try_from_raw(addr, addr_len)? }
+    } else {
+        None
+    };
+
     let file_ref = current!().file(fd as FileDesc)?;
     if let Ok(socket) = file_ref.as_socket() {
-        if need_check {
-            from_user::check_ptr(addr as *const libc::sockaddr_in)?;
-        }
-        let ret = try_libc!(libc::ocall::connect(socket.fd(), addr, addr_len));
-        Ok(ret as isize)
+        socket.connect(addr_option)?;
     } else if let Ok(unix_socket) = file_ref.as_unix_socket() {
-        let addr = addr as *const libc::sockaddr_un;
-        from_user::check_ptr(addr)?;
-        let path = from_user::clone_cstring_safely(unsafe { (&*addr).sun_path.as_ptr() })?
-            .to_string_lossy()
-            .into_owned();
-        unix_socket.connect(path)?;
-        Ok(0)
+        unix_socket.connect(addr_option)?;
     } else {
         return_errno!(EBADF, "not a socket")
     }
+
+    Ok(0)
 }
 
 pub fn do_accept(
@@ -80,93 +111,51 @@ pub fn do_accept4(
     addr_len: *mut libc::socklen_t,
     flags: c_int,
 ) -> Result<isize> {
-    debug!(
-        "accept4: fd: {}, addr: {:?}, addr_len: {:?}, flags: {:#x}",
-        fd, addr, addr_len, flags
-    );
-
     let need_check: bool = !addr.is_null();
-
-    if addr.is_null() ^ addr_len.is_null() {
-        return_errno!(EINVAL, "addr and ddr_len should be both null");
-    }
-    if need_check {
+    let mut addr_buf_option = if need_check {
+        from_user::check_ptr(addr_len)?;
         from_user::check_mut_array(addr as *mut u8, unsafe { *addr_len } as usize)?;
-    }
+        let buf = unsafe { std::slice::from_raw_parts_mut(addr as *mut u8, *addr_len as usize) };
+        Some(buf)
+    } else {
+        None
+    };
+
+    let file_flags = FileFlags::from_bits(flags).ok_or_else(|| errno!(EINVAL, "invalid flags"))?;
+    let close_on_spawn = file_flags.contains(FileFlags::SOCK_CLOEXEC);
 
     let file_ref = current!().file(fd as FileDesc)?;
-    if let Ok(socket) = file_ref.as_socket() {
-        if need_check {
-            from_user::check_mut_ptr(addr as *mut libc::sockaddr_in)?;
-        }
-
-        let new_socket = socket.accept(addr, addr_len, flags)?;
-        let new_file_ref: Arc<Box<dyn File>> = Arc::new(Box::new(new_socket));
-        let new_fd = current!().add_file(new_file_ref, false);
-
-        Ok(new_fd as isize)
+    let (new_fd, ret_addr_len) = if let Ok(socket) = file_ref.as_socket() {
+        let (new_socket_file, ret_addr_len) = socket.accept(file_flags, addr_buf_option)?;
+        let new_file_ref: Arc<Box<dyn File>> = Arc::new(Box::new(new_socket_file));
+        let new_fd = current!().add_file(new_file_ref, close_on_spawn);
+        (new_fd, ret_addr_len)
     } else if let Ok(unix_socket) = file_ref.as_unix_socket() {
-        let addr = addr as *mut libc::sockaddr_un;
-        if need_check {
-            from_user::check_mut_ptr(addr)?;
-        }
-        // TODO: handle addr
-        let new_socket = unix_socket.accept()?;
-        let new_file_ref: Arc<Box<dyn File>> = Arc::new(Box::new(new_socket));
-        let new_fd = current!().add_file(new_file_ref, false);
-
-        Ok(new_fd as isize)
+        let (new_unix_socket, ret_addr_len) = unix_socket.accept(file_flags, addr_buf_option)?;
+        let new_file_ref: Arc<Box<dyn File>> = Arc::new(Box::new(new_unix_socket));
+        let new_fd = current!().add_file(new_file_ref, close_on_spawn);
+        (new_fd, ret_addr_len)
     } else {
-        return_errno!(EBADF, "not a socket")
+        return_errno!(EBADF, "not a socket");
+    };
+
+    if ret_addr_len != 0 && !addr_len.is_null() {
+        unsafe {
+            *addr_len = ret_addr_len as u32;
+        }
     }
+
+    Ok(new_fd as isize)
 }
 
 pub fn do_shutdown(fd: c_int, how: c_int) -> Result<isize> {
     debug!("shutdown: fd: {}, how: {}", fd, how);
     let file_ref = current!().file(fd as FileDesc)?;
     if let Ok(socket) = file_ref.as_socket() {
-        let ret = try_libc!(libc::ocall::shutdown(socket.fd(), how));
+        let ret = try_libc!(libc::ocall::shutdown(socket.host_fd(), how));
         Ok(ret as isize)
     } else {
-        return_errno!(EBADF, "not a socket")
-    }
-}
-
-pub fn do_bind(fd: c_int, addr: *const libc::sockaddr, addr_len: libc::socklen_t) -> Result<isize> {
-    debug!("bind: fd: {}, addr: {:?}, addr_len: {}", fd, addr, addr_len);
-    if addr.is_null() && addr_len == 0 {
-        return_errno!(EINVAL, "no address is specified");
-    }
-    from_user::check_array(addr as *const u8, addr_len as usize)?;
-
-    let file_ref = current!().file(fd as FileDesc)?;
-    if let Ok(socket) = file_ref.as_socket() {
-        from_user::check_ptr(addr as *const libc::sockaddr_in)?;
-        let ret = try_libc!(libc::ocall::bind(socket.fd(), addr, addr_len));
-        Ok(ret as isize)
-    } else if let Ok(unix_socket) = file_ref.as_unix_socket() {
-        let addr = addr as *const libc::sockaddr_un;
-        from_user::check_ptr(addr)?;
-        let path = from_user::clone_cstring_safely(unsafe { (&*addr).sun_path.as_ptr() })?
-            .to_string_lossy()
-            .into_owned();
-        unix_socket.bind(path)?;
-        Ok(0)
-    } else {
-        return_errno!(EBADF, "not a socket")
-    }
-}
-
-pub fn do_listen(fd: c_int, backlog: c_int) -> Result<isize> {
-    debug!("listen: fd: {}, backlog: {}", fd, backlog);
-    let file_ref = current!().file(fd as FileDesc)?;
-    if let Ok(socket) = file_ref.as_socket() {
-        let ret = try_libc!(libc::ocall::listen(socket.fd(), backlog));
-        Ok(ret as isize)
-    } else if let Ok(unix_socket) = file_ref.as_unix_socket() {
-        unix_socket.listen()?;
-        Ok(0)
-    } else {
+        // TODO: support unix socket
         return_errno!(EBADF, "not a socket")
     }
 }
@@ -185,7 +174,7 @@ pub fn do_setsockopt(
     let file_ref = current!().file(fd as FileDesc)?;
     if let Ok(socket) = file_ref.as_socket() {
         let ret = try_libc!(libc::ocall::setsockopt(
-            socket.fd(),
+            socket.host_fd(),
             level,
             optname,
             optval,
@@ -215,7 +204,7 @@ pub fn do_getsockopt(
     let socket = file_ref.as_socket()?;
 
     let ret = try_libc!(libc::ocall::getsockopt(
-        socket.fd(),
+        socket.host_fd(),
         level,
         optname,
         optval,
@@ -235,7 +224,7 @@ pub fn do_getpeername(
     );
     let file_ref = current!().file(fd as FileDesc)?;
     if let Ok(socket) = file_ref.as_socket() {
-        let ret = try_libc!(libc::ocall::getpeername(socket.fd(), addr, addr_len));
+        let ret = try_libc!(libc::ocall::getpeername(socket.host_fd(), addr, addr_len));
         Ok(ret as isize)
     } else if let Ok(unix_socket) = file_ref.as_unix_socket() {
         warn!("getpeername for unix socket is unimplemented");
@@ -259,7 +248,7 @@ pub fn do_getsockname(
     );
     let file_ref = current!().file(fd as FileDesc)?;
     if let Ok(socket) = file_ref.as_socket() {
-        let ret = try_libc!(libc::ocall::getsockname(socket.fd(), addr, addr_len));
+        let ret = try_libc!(libc::ocall::getsockname(socket.host_fd(), addr, addr_len));
         Ok(ret as isize)
     } else if let Ok(unix_socket) = file_ref.as_unix_socket() {
         warn!("getsockname for unix socket is unimplemented");
@@ -277,35 +266,38 @@ pub fn do_sendto(
     addr: *const libc::sockaddr,
     addr_len: libc::socklen_t,
 ) -> Result<isize> {
-    debug!(
-        "sendto: fd: {}, base: {:?}, len: {}, flags: {} addr: {:?}, addr_len: {}",
-        fd, base, len, flags, addr, addr_len
-    );
+    if len == 0 {
+        return Ok(0);
+    }
+
+    if addr.is_null() ^ (addr_len == 0) {
+        return_errno!(EINVAL, "addr and ddr_len should be both null");
+    }
+
     from_user::check_array(base as *const u8, len)?;
+    let buf = unsafe { std::slice::from_raw_parts(base as *const u8, len as usize) };
+
+    let need_check: bool = !addr.is_null();
+    if need_check {
+        from_user::check_mut_array(addr as *mut u8, addr_len as usize)?;
+    }
+
+    let send_flags = SendFlags::from_bits(flags).unwrap();
+
+    let addr_option = if need_check {
+        unsafe { SockAddr::try_from_raw(addr, addr_len)? }
+    } else {
+        None
+    };
 
     let file_ref = current!().file(fd as FileDesc)?;
     if let Ok(socket) = file_ref.as_socket() {
-        // TODO: check addr and addr_len according to connection mode
-        let ret = try_libc!(libc::ocall::sendto(
-            socket.fd(),
-            base,
-            len,
-            flags,
-            addr,
-            addr_len
-        ));
-        Ok(ret as isize)
+        socket
+            .sendto(buf, send_flags, addr_option)
+            .map(|u| u as isize)
     } else if let Ok(unix) = file_ref.as_unix_socket() {
-        if !addr.is_null() || addr_len != 0 {
-            return_errno!(EISCONN, "Only connection-mode socket is supported");
-        }
-
-        if !unix.is_connected() {
-            return_errno!(ENOTCONN, "the socket has not been connected yet");
-        }
-
-        let data = unsafe { std::slice::from_raw_parts(base as *const u8, len) };
-        unix.write(data).map(|u| u as isize)
+        unix.sendto(buf, send_flags, addr_option)
+            .map(|u| u as isize)
     } else {
         return_errno!(EBADF, "unsupported file type");
     }
@@ -319,22 +311,44 @@ pub fn do_recvfrom(
     addr: *mut libc::sockaddr,
     addr_len: *mut libc::socklen_t,
 ) -> Result<isize> {
-    debug!(
-        "recvfrom: fd: {}, base: {:?}, len: {}, flags: {}, addr: {:?}, addr_len: {:?}",
-        fd, base, len, flags, addr, addr_len
-    );
-    let file_ref = current!().file(fd as FileDesc)?;
-    let socket = file_ref.as_socket()?;
+    if addr.is_null() ^ addr_len.is_null() {
+        return_errno!(EINVAL, "addr and ddr_len should be both null");
+    }
 
-    let ret = try_libc!(libc::ocall::recvfrom(
-        socket.fd(),
-        base,
-        len,
-        flags,
-        addr,
-        addr_len
-    ));
-    Ok(ret as isize)
+    from_user::check_array(base as *mut u8, len)?;
+    let mut buf = unsafe { std::slice::from_raw_parts_mut(base as *mut u8, len as usize) };
+
+    // MSG_CTRUNC is a return flag but linux allows it to be set on input flags.
+    // We just ignore it.
+    let recv_flags = RecvFlags::from_bits(flags & !(MsgHdrFlags::MSG_CTRUNC.bits()))
+        .ok_or_else(|| errno!(EINVAL, "invalid flags"))?;
+
+    let need_check: bool = !addr.is_null();
+    let addr_buf_option = if need_check {
+        from_user::check_ptr(addr_len)?;
+        from_user::check_mut_array(addr as *mut u8, unsafe { *addr_len } as usize)?;
+        let buf = unsafe { std::slice::from_raw_parts_mut(addr as *mut u8, *addr_len as usize) };
+        Some(buf)
+    } else {
+        None
+    };
+
+    let file_ref = current!().file(fd as FileDesc)?;
+    let (data_len, ret_addr_len) = if let Ok(socket) = file_ref.as_socket() {
+        socket.recvfrom(buf, recv_flags, addr_buf_option)?
+    } else if let Ok(unix) = file_ref.as_unix_socket() {
+        unix.recvfrom(buf, recv_flags, addr_buf_option)?
+    } else {
+        return_errno!(EBADF, "not a socket");
+    };
+
+    if ret_addr_len != 0 && !addr_len.is_null() {
+        unsafe {
+            *addr_len = ret_addr_len as u32;
+        }
+    }
+
+    Ok(data_len as isize)
 }
 
 pub fn do_socketpair(
@@ -347,23 +361,26 @@ pub fn do_socketpair(
         "socketpair: domain: {}, type:0x{:x}, protocol: {}",
         domain, socket_type, protocol
     );
+
     let mut sock_pair = unsafe {
         from_user::check_mut_array(sv, 2)?;
         std::slice::from_raw_parts_mut(sv as *mut u32, 2)
     };
 
-    if (domain == libc::AF_UNIX) {
-        let (client_socket, server_socket) =
-            UnixSocketFile::socketpair(socket_type as i32, protocol as i32)?;
+    let file_flags = FileFlags::from_bits_truncate(socket_type);
+    let sock_type = SocketType::try_from(socket_type & (!file_flags.bits()))?;
+    let close_on_spawn = file_flags.contains(FileFlags::SOCK_CLOEXEC);
+
+    let domain = ProtocolFamily::try_from(domain as u16)?;
+    if (domain == ProtocolFamily::PF_LOCAL) {
+        let (client_socket, server_socket) = UnixSocket::socketpair(sock_type, file_flags)?;
         let current = current!();
         let mut files = current.files().lock().unwrap();
-        sock_pair[0] = files.put(Arc::new(Box::new(client_socket)), false);
-        sock_pair[1] = files.put(Arc::new(Box::new(server_socket)), false);
+        sock_pair[0] = files.put(Arc::new(Box::new(client_socket)), close_on_spawn);
+        sock_pair[1] = files.put(Arc::new(Box::new(server_socket)), close_on_spawn);
 
         debug!("socketpair: ({}, {})", sock_pair[0], sock_pair[1]);
         Ok(0)
-    } else if (domain == libc::AF_TIPC) {
-        return_errno!(EAFNOSUPPORT, "cluster domain sockets not supported")
     } else {
         return_errno!(EAFNOSUPPORT, "domain not supported")
     }

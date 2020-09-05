@@ -59,5 +59,9 @@
                 "temporary": true
             }
         }
-    ]
+    ],
+    "networking": {
+        "host_paths": [
+        ]
+    }
 }

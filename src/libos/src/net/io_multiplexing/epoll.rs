@@ -94,7 +94,7 @@ impl EpollFile {
         let host_fd = {
             let fd_ref = current!().file(fd)?;
             if let Ok(socket) = fd_ref.as_socket() {
-                socket.fd()
+                socket.host_fd()
             } else if let Ok(eventfd) = fd_ref.as_event() {
                 eventfd.get_host_fd()
             } else if let Ok(epoll_file) = fd_ref.as_epfile() {

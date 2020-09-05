@@ -16,6 +16,8 @@
 // for may_dangle in rw_lock
 #![feature(dropck_eyepatch)]
 #![feature(option_expect_none)]
+// for Arc::get_mut_unchecked
+#![feature(get_mut_unchecked)]
 
 #[macro_use]
 extern crate alloc;

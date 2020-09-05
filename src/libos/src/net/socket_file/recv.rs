@@ -2,22 +2,51 @@ use super::*;
 use crate::untrusted::{SliceAsMutPtrAndLen, SliceAsPtrAndLen, UntrustedSliceAlloc};
 
 impl SocketFile {
-    // TODO: need sockaddr type to implement send/sento
-    /*
-    pub fn recv(&self, buf: &mut [u8], flags: MsgHdrFlags) -> Result<usize> {
-        let (bytes_recvd, _) = self.recvfrom(buf, flags, None)?;
+    pub fn recv(&self, buf: &mut [u8], flags: RecvFlags) -> Result<usize> {
+        let (bytes_recvd, ret_addr_len) = self.recvfrom(buf, flags, None)?;
+        assert_eq!(ret_addr_len, 0);
         Ok(bytes_recvd)
     }
 
-    pub fn recvfrom(&self, buf: &mut [u8], flags: MsgHdrFlags, src_addr: Option<&mut [u8]>) -> Result<(usize, usize)> {
-        let (bytes_recvd, src_addr_len, _, _) = self.do_recvmsg(
-            &mut buf[..],
-            flags,
-            src_addr,
-            None,
-        )?;
-        Ok((bytes_recvd, src_addr_len))
-    }*/
+    // TODO: use recvmsg to impl recvfrom
+    pub fn recvfrom(
+        &self,
+        buf: &mut [u8],
+        flags: RecvFlags,
+        addr: Option<&mut [u8]>,
+    ) -> Result<(usize, usize)> {
+        let mut len = 0;
+        let addr_len_ptr = if let Some(addr_buffer) = &addr {
+            len = addr_buffer.len() as libc::socklen_t;
+            &mut len as *mut libc::socklen_t
+        } else {
+            std::ptr::null_mut()
+        };
+
+        let untrusted_addr: &mut [u8] = &mut vec![0; len as usize];
+        let addr_ptr = if len != 0 {
+            untrusted_addr.as_mut_ptr() as *mut libc::sockaddr
+        } else {
+            std::ptr::null_mut()
+        };
+
+        let ret = try_libc!(libc::ocall::recvfrom(
+            self.host_fd(),
+            buf.as_mut_ptr() as *mut c_void,
+            buf.len(),
+            flags.bits(),
+            addr_ptr,
+            addr_len_ptr,
+        )) as usize;
+
+        if let Some(dst) = addr {
+            let copy_len = std::cmp::min(len as usize, dst.len());
+            dst[..copy_len].copy_from_slice(&untrusted_addr[0..copy_len]);
+        }
+
+        assert!(ret <= buf.len());
+        Ok((ret, len as usize))
+    }
 
     pub fn recvmsg<'a, 'b>(&self, msg: &'b mut MsgHdrMut<'a>, flags: RecvFlags) -> Result<usize> {
         // Alloc untrusted iovecs to receive data via OCall
@@ -68,7 +97,7 @@ impl SocketFile {
     ) -> Result<(usize, usize, usize, MsgHdrFlags)> {
         // Prepare the arguments for OCall
         // Host socket fd
-        let host_fd = self.host_fd;
+        let host_fd = self.host_fd();
         // Name
         let (msg_name, msg_namelen) = name.as_mut_ptr_and_len();
         let msg_name = msg_name as *mut c_void;
