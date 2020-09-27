@@ -1,5 +1,5 @@
 use super::*;
-use crate::fs::{File, FileRef, IoctlCmd};
+use crate::fs::{AccessMode, File, FileRef, IoctlCmd, StatusFlags};
 use crate::util::ring_buf::{ring_buffer, RingBufReader, RingBufWriter};
 use rcore_fs::vfs::{FileType, Metadata, Timespec};
 use std::any::Any;
@@ -131,6 +131,88 @@ impl File for UnixSocket {
             }
             Path::Libos => self.libos_sock.read().unwrap().as_ref().unwrap().ioctl(cmd),
             Path::Host => self.host_sock.read().unwrap().as_ref().unwrap().ioctl(cmd),
+        }
+    }
+
+    fn get_access_mode(&self) -> Result<AccessMode> {
+        Ok(AccessMode::O_RDWR)
+    }
+
+    fn get_status_flags(&self) -> Result<StatusFlags> {
+        match self.source() {
+            Path::Unknown => {
+                if !HOST_UNIX_ADDRS.is_empty() {
+                    if let Some(sock) = self.libos_sock.read().unwrap().as_ref() {
+                        sock.get_status_flags()?;
+                    }
+                    self.host_sock
+                        .read()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .get_status_flags()
+                } else {
+                    self.libos_sock
+                        .read()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .get_status_flags()
+                }
+            }
+            Path::Libos => self
+                .libos_sock
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .get_status_flags(),
+            Path::Host => self
+                .host_sock
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .get_status_flags(),
+        }
+    }
+
+    fn set_status_flags(&self, new_status_flags: StatusFlags) -> Result<()> {
+        match self.source() {
+            Path::Unknown => {
+                if !HOST_UNIX_ADDRS.is_empty() {
+                    if let Some(sock) = self.libos_sock.read().unwrap().as_ref() {
+                        sock.set_status_flags(new_status_flags)?;
+                    }
+                    self.host_sock
+                        .read()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .set_status_flags(new_status_flags)
+                } else {
+                    self.libos_sock
+                        .read()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .set_status_flags(new_status_flags)
+                }
+            }
+            Path::Libos => self
+                .libos_sock
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .set_status_flags(new_status_flags),
+            Path::Host => self
+                .host_sock
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .set_status_flags(new_status_flags),
         }
     }
 

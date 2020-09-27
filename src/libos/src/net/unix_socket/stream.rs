@@ -1,6 +1,6 @@
 use super::*;
 use alloc::sync::{Arc, Weak};
-use fs::{File, FileRef, IoctlCmd};
+use fs::{AccessMode, File, FileRef, IoctlCmd, StatusFlags};
 use rcore_fs::vfs::{FileType, Metadata, Timespec};
 use std::any::Any;
 use std::collections::btree_map::BTreeMap;
@@ -199,6 +199,32 @@ impl File for StreamUnixSocket {
         Ok(0)
     }
 
+    fn get_access_mode(&self) -> Result<AccessMode> {
+        Ok(AccessMode::O_RDWR)
+    }
+
+    fn get_status_flags(&self) -> Result<StatusFlags> {
+        if self.is_blocking() {
+            Ok(StatusFlags::empty())
+        } else {
+            Ok(StatusFlags::O_NONBLOCK)
+        }
+    }
+
+    fn set_status_flags(&self, new_status_flags: StatusFlags) -> Result<()> {
+        // Only O_NONBLOCK, O_ASYNC and O_DIRECT can be set
+        let status_flags = new_status_flags
+            & (StatusFlags::O_NONBLOCK | StatusFlags::O_ASYNC | StatusFlags::O_DIRECT);
+
+        // Only O_NONBLOCK is supported
+        if new_status_flags.contains(StatusFlags::O_NONBLOCK) {
+            self.set_non_blocking();
+        } else {
+            self.set_blocking();
+        }
+        Ok(())
+    }
+
     fn poll(&self) -> Result<PollEventFlags> {
         if let Some(ref channel) = *self.channel.lock().unwrap() {
             channel.poll()
@@ -276,6 +302,12 @@ impl StreamUnixSocket {
         self.is_blocking.store(false, Ordering::SeqCst);
         let channel = self.channel.lock().unwrap();
         channel.as_ref().map(|c| c.set_non_blocking());
+    }
+
+    pub fn set_blocking(&self) {
+        self.is_blocking.store(true, Ordering::SeqCst);
+        let channel = self.channel.lock().unwrap();
+        channel.as_ref().map(|c| c.set_blocking());
     }
 }
 
@@ -394,6 +426,11 @@ impl EndPoint {
     pub fn set_non_blocking(&self) {
         self.reader.lock().unwrap().set_non_blocking();
         self.writer.lock().unwrap().set_non_blocking();
+    }
+
+    pub fn set_blocking(&self) {
+        self.reader.lock().unwrap().set_blocking();
+        self.writer.lock().unwrap().set_blocking();
     }
 
     pub fn read(&self, buf: &mut [u8]) -> Result<usize> {
