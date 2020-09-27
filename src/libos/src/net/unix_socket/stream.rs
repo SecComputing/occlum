@@ -309,6 +309,25 @@ impl StreamUnixSocket {
         let channel = self.channel.lock().unwrap();
         channel.as_ref().map(|c| c.set_blocking());
     }
+
+    pub fn get_sockname(
+        &self,
+        addr: *mut libc::sockaddr,
+        addr_len: *mut libc::socklen_t,
+    ) -> Result<()> {
+        if let Some(str) = self.path() {
+            let mut dst = unsafe {
+                std::slice::from_raw_parts_mut(addr as *mut _ as *mut u8, *addr_len as usize)
+            };
+            let unix = UnixAddr::new(&str)?;
+            let addr = SockAddr::UnixSocket(unix);
+            addr.copy_to_slice(dst);
+            unsafe {
+                *addr_len = unix.len() as u32;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Debug for StreamUnixSocket {

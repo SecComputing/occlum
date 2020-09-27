@@ -103,6 +103,12 @@ impl EpollFile {
                     return_errno!(EINVAL, "epfd should not be same as the target fd");
                 }
                 target_host_fd
+            } else if let Ok(uds) = fd_ref.as_unix_socket() {
+                if let Ok(host_fd) = uds.host_fd() {
+                    host_fd
+                } else {
+                    return_errno!(EPERM, "unsupported unix socket type");
+                }
             } else {
                 return_errno!(EPERM, "unsupported file type");
             }

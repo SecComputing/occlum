@@ -153,11 +153,14 @@ pub fn do_shutdown(fd: c_int, how: c_int) -> Result<isize> {
     let file_ref = current!().file(fd as FileDesc)?;
     if let Ok(socket) = file_ref.as_socket() {
         let ret = try_libc!(libc::ocall::shutdown(socket.host_fd(), how));
-        Ok(ret as isize)
+    } else if let Ok(uds) = file_ref.as_unix_socket() {
+        uds.shutdown(how);
     } else {
         // TODO: support unix socket
         return_errno!(EBADF, "not a socket")
     }
+
+    Ok(0)
 }
 
 pub fn do_setsockopt(
@@ -251,7 +254,7 @@ pub fn do_getsockname(
         let ret = try_libc!(libc::ocall::getsockname(socket.host_fd(), addr, addr_len));
         Ok(ret as isize)
     } else if let Ok(unix_socket) = file_ref.as_unix_socket() {
-        warn!("getsockname for unix socket is unimplemented");
+        unix_socket.get_sockname(addr, addr_len)?;
         Ok(0)
     } else {
         return_errno!(EBADF, "not a socket")
@@ -393,22 +396,24 @@ pub fn do_sendmsg(fd: c_int, msg_ptr: *const msghdr, flags_c: c_int) -> Result<i
     );
 
     let file_ref = current!().file(fd as FileDesc)?;
+    let msg_c = {
+        from_user::check_ptr(msg_ptr)?;
+        let msg_c = unsafe { &*msg_ptr };
+        msg_c.check_member_ptrs()?;
+        msg_c
+    };
+    let msg = unsafe { MsgHdr::from_c(&msg_c)? };
+
+    let flags = SendFlags::from_bits_truncate(flags_c);
+
     if let Ok(socket) = file_ref.as_socket() {
-        let msg_c = {
-            from_user::check_ptr(msg_ptr)?;
-            let msg_c = unsafe { &*msg_ptr };
-            msg_c.check_member_ptrs()?;
-            msg_c
-        };
-        let msg = unsafe { MsgHdr::from_c(&msg_c)? };
-
-        let flags = SendFlags::from_bits_truncate(flags_c);
-
         socket
             .sendmsg(&msg, flags)
             .map(|bytes_sent| bytes_sent as isize)
     } else if let Ok(socket) = file_ref.as_unix_socket() {
-        return_errno!(EBADF, "does not support unix socket")
+        socket
+            .sendmsg(&msg, flags)
+            .map(|bytes_sent| bytes_sent as isize)
     } else {
         return_errno!(EBADF, "not a socket")
     }
@@ -419,24 +424,25 @@ pub fn do_recvmsg(fd: c_int, msg_mut_ptr: *mut msghdr_mut, flags_c: c_int) -> Re
         "recvmsg: fd: {}, msg: {:?}, flags: 0x{:x}",
         fd, msg_mut_ptr, flags_c
     );
+    let msg_mut_c = {
+        from_user::check_mut_ptr(msg_mut_ptr)?;
+        let msg_mut_c = unsafe { &mut *msg_mut_ptr };
+        msg_mut_c.check_member_ptrs()?;
+        msg_mut_c
+    };
+    let mut msg_mut = unsafe { MsgHdrMut::from_c(msg_mut_c)? };
+
+    let flags = RecvFlags::from_bits_truncate(flags_c);
 
     let file_ref = current!().file(fd as FileDesc)?;
     if let Ok(socket) = file_ref.as_socket() {
-        let msg_mut_c = {
-            from_user::check_mut_ptr(msg_mut_ptr)?;
-            let msg_mut_c = unsafe { &mut *msg_mut_ptr };
-            msg_mut_c.check_member_ptrs()?;
-            msg_mut_c
-        };
-        let mut msg_mut = unsafe { MsgHdrMut::from_c(msg_mut_c)? };
-
-        let flags = RecvFlags::from_bits_truncate(flags_c);
-
         socket
             .recvmsg(&mut msg_mut, flags)
             .map(|bytes_recvd| bytes_recvd as isize)
     } else if let Ok(socket) = file_ref.as_unix_socket() {
-        return_errno!(EBADF, "does not support unix socket")
+        socket
+            .recvmsg(&mut msg_mut, flags)
+            .map(|bytes_recvd| bytes_recvd as isize)
     } else {
         return_errno!(EBADF, "not a socket")
     }

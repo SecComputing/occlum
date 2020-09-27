@@ -27,6 +27,19 @@ impl SocketFile {
         Ok(Self { host_fd: ret })
     }
 
+    pub fn get_sockname(
+        &self,
+        addr: *mut libc::sockaddr,
+        addr_len: *mut libc::socklen_t,
+    ) -> Result<()> {
+        try_libc!(libc::ocall::getsockname(self.host_fd(), addr, addr_len));
+        Ok(())
+    }
+
+    pub fn shutdown(&self, how: c_int) -> Result<()> {
+        try_libc!(libc::ocall::shutdown(self.host_fd(), how));
+        Ok(())
+    }
     pub fn bind(&self, addr: SockAddr) -> Result<()> {
         let (addr_ptr, addr_len) = addr.as_ptr_and_len();
 

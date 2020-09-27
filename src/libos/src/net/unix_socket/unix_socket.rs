@@ -50,20 +50,18 @@ impl File for UnixSocket {
     }
 
     fn writev(&self, bufs: &[&[u8]]) -> Result<usize> {
-        // Writev to libos sock first. If it fails, writev to host.
-        // It may raise the concern about risks to send libos data to host.
-        // The above risk only exits in the situation where libos sock
-        // is not properly used.
-        let libos_sock = self.libos_sock.read().unwrap();
-        let ret = libos_sock.as_ref().map(|s| s.writev(bufs));
-        if let Some(Ok(_)) = ret {
-            ret.unwrap()
-        } else if HOST_UNIX_ADDRS.is_empty() {
-            ret.unwrap()
-        } else {
-            debug!("libos ret is {:?}", ret);
-            let host_sock = self.host_sock.read().unwrap();
-            host_sock.as_ref().unwrap().writev(bufs)
+        match self.source() {
+            Path::Unknown => {
+                return_errno!(ENOTCONN, "Socket is not connected");
+            }
+            Path::Libos => {
+                let libos_sock = self.libos_sock.read().unwrap();
+                libos_sock.as_ref().unwrap().writev(bufs)
+            }
+            Path::Host => {
+                let host_sock = self.host_sock.read().unwrap();
+                host_sock.as_ref().unwrap().writev(bufs)
+            }
         }
     }
 
@@ -145,35 +143,21 @@ impl File for UnixSocket {
                     if let Some(sock) = self.libos_sock.read().unwrap().as_ref() {
                         sock.get_status_flags()?;
                     }
-                    self.host_sock
-                        .read()
-                        .unwrap()
-                        .as_ref()
-                        .unwrap()
-                        .get_status_flags()
+                    let host_sock = self.host_sock.read().unwrap();
+                    host_sock.as_ref().unwrap().get_status_flags()
                 } else {
-                    self.libos_sock
-                        .read()
-                        .unwrap()
-                        .as_ref()
-                        .unwrap()
-                        .get_status_flags()
+                    let libos_sock = self.libos_sock.read().unwrap();
+                    libos_sock.as_ref().unwrap().get_status_flags()
                 }
             }
-            Path::Libos => self
-                .libos_sock
-                .read()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .get_status_flags(),
-            Path::Host => self
-                .host_sock
-                .read()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .get_status_flags(),
+            Path::Libos => {
+                let libos_sock = self.libos_sock.read().unwrap();
+                libos_sock.as_ref().unwrap().get_status_flags()
+            }
+            Path::Host => {
+                let host_sock = self.host_sock.read().unwrap();
+                host_sock.as_ref().unwrap().get_status_flags()
+            }
         }
     }
 
@@ -325,14 +309,23 @@ impl Socket for UnixSocket {
             libos_call = self.libos_sock.read().unwrap().is_some();
             // It will not fail to connect to a newly created socket with null addr
             host_call = !HOST_UNIX_ADDRS.is_empty();
+            *self.source.write().unwrap() = Path::Unknown;
         } else {
             host_call = addr.unwrap().is_from_host();
             libos_call = !host_call;
+            if host_call {
+                *self.source.write().unwrap() = Path::Host;
+            } else {
+                *self.source.write().unwrap() = Path::Libos;
+            }
         }
 
         debug!(
-            "addr {:?} host_call {} and libos_call {}",
-            addr, host_call, libos_call
+            "addr {:?} host_call {} and libos_call {} source {:?}",
+            addr,
+            host_call,
+            libos_call,
+            self.source()
         );
 
         if host_call {
@@ -350,17 +343,19 @@ impl Socket for UnixSocket {
 
     fn sendto(&self, buf: &[u8], flags: SendFlags, addr: Option<SockAddr>) -> Result<usize> {
         if addr.is_none() {
-            let libos_sock = self.libos_sock.read().unwrap();
-            let ret = libos_sock.as_ref().map(|s| s.sendto(buf, flags, addr));
-            if let Some(Ok(_)) = ret {
-                ret.unwrap()
-            } else if HOST_UNIX_ADDRS.is_empty() {
-                ret.unwrap()
-            } else {
-                debug!("sendto in libos error is {:?}", ret);
-                drop(libos_sock);
-                let host_sock = self.host_sock.read().unwrap();
-                host_sock.as_ref().unwrap().sendto(buf, flags, addr)
+            // send should always know the dest
+            match self.source() {
+                Path::Unknown => {
+                    return_errno!(ENOTCONN, "Socket is not connected");
+                }
+                Path::Libos => {
+                    let libos_sock = self.libos_sock.read().unwrap();
+                    libos_sock.as_ref().unwrap().sendto(buf, flags, None)
+                }
+                Path::Host => {
+                    let host_sock = self.host_sock.read().unwrap();
+                    host_sock.as_ref().unwrap().sendto(buf, flags, None)
+                }
             }
         } else {
             if addr.unwrap().is_from_host() {
@@ -385,6 +380,11 @@ impl Socket for UnixSocket {
             None
         };
 
+        // connectless recvfrom may not know the src in advance
+        // recvfrom libos sock first. If it fails, recvfrom host.
+        // It may raise the concern about risks for libos to recv data from host.
+        // The above risk only exits in the situation where libos sock
+        // is not properly used.
         let libos_sock = self.libos_sock.read().unwrap();
         let ret = libos_sock
             .as_ref()
@@ -446,6 +446,64 @@ impl UnixSocket {
 
     fn socket_type(&self) -> SocketType {
         self.socket_type
+    }
+
+    pub fn host_fd(&self) -> Result<c_int> {
+        match self.source() {
+            Path::Host => Ok(self.host_sock.read().unwrap().as_ref().unwrap().host_fd()),
+            _ => return_errno!(ENOSYS, "not support host_fd"),
+        }
+    }
+
+    pub fn get_sockname(
+        &self,
+        addr: *mut libc::sockaddr,
+        addr_len: *mut libc::socklen_t,
+    ) -> Result<()> {
+        match self.source() {
+            Path::Unknown => Ok(()),
+            Path::Libos => {
+                let libos_sock = self.libos_sock.read().unwrap();
+                libos_sock.as_ref().unwrap().get_sockname(addr, addr_len)
+            }
+            Path::Host => {
+                let libos_sock = self.host_sock.read().unwrap();
+                libos_sock.as_ref().unwrap().get_sockname(addr, addr_len)
+            }
+        }
+    }
+
+    pub fn sendmsg<'a, 'b>(&self, msg: &'b MsgHdr<'a>, flags: SendFlags) -> Result<usize> {
+        match self.source() {
+            Path::Host => {
+                let host_sock = self.host_sock.read().unwrap();
+                host_sock.as_ref().unwrap().sendmsg(msg, flags)
+            }
+            _ => return_errno!(ENOSYS, "not support host_fd"),
+        }
+    }
+
+    pub fn recvmsg<'a, 'b>(&self, msg: &'b mut MsgHdrMut<'a>, flags: RecvFlags) -> Result<usize> {
+        match self.source() {
+            Path::Host => {
+                let host_sock = self.host_sock.read().unwrap();
+                host_sock.as_ref().unwrap().recvmsg(msg, flags)
+            }
+            _ => return_errno!(ENOSYS, "not support host_fd"),
+        }
+    }
+
+    pub fn shutdown(&self, how: c_int) -> Result<()> {
+        match self.source() {
+            Path::Host => {
+                let host_sock = self.host_sock.read().unwrap();
+                host_sock.as_ref().unwrap().shutdown(how)
+            }
+            _ => {
+                warn!("shutdown not supported in the unix socket");
+                Ok(())
+            }
+        }
     }
 
     // Only return socket pair in libos.
