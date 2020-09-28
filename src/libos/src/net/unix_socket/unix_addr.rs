@@ -6,8 +6,14 @@ const MAX_PATH_LEN: usize = 108;
 
 lazy_static! {
     pub static ref HOST_UNIX_ADDRS: Vec<SockAddr> = config::LIBOS_CONFIG
-        .networking
-        .host_paths
+        .host_unix_address
+        .path_name
+        .iter()
+        .map(|path| SockAddr::UnixSocket(UnixAddr::new(&path).unwrap()))
+        .collect();
+    pub static ref HOST_UNIX_ADDRS_A: Vec<SockAddr> = config::LIBOS_CONFIG
+        .host_unix_address
+        .abstract_name
         .iter()
         .map(|path| SockAddr::UnixSocket(UnixAddr::new(&path).unwrap()))
         .collect();

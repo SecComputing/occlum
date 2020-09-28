@@ -51,6 +51,6 @@ cat <<EOF
     ],
     "env": $OCCLUM_CONF_ENV,
     "entry_points": $OCCLUM_CONF_ENTRY_POINTS,
-    "networking": $OCCLUM_CONF_NET
+    "host_unix_address": $OCCLUM_CONF_HOST_UNIX_ADDR
 }
 EOF

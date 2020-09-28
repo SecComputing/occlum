@@ -89,7 +89,7 @@ pub struct Config {
     pub env: ConfigEnv,
     pub entry_points: Vec<PathBuf>,
     pub mount: Vec<ConfigMount>,
-    pub networking: ConfigNet,
+    pub host_unix_address: ConfigUnixAddr,
 }
 
 #[derive(Debug)]
@@ -136,8 +136,9 @@ pub struct ConfigMountOptions {
 }
 
 #[derive(Debug)]
-pub struct ConfigNet {
-    pub host_paths: Vec<String>,
+pub struct ConfigUnixAddr {
+    pub path_name: Vec<String>,
+    pub abstract_name: Vec<String>,
 }
 
 impl Config {
@@ -163,7 +164,7 @@ impl Config {
             }
             mount
         };
-        let networking = ConfigNet::from_input(&input.networking);
+        let host_unix_address = ConfigUnixAddr::from_input(&input.host_unix_address);
 
         Ok(Config {
             resource_limits,
@@ -171,7 +172,7 @@ impl Config {
             env,
             entry_points,
             mount,
-            networking,
+            host_unix_address,
         })
     }
 }
@@ -264,10 +265,11 @@ impl ConfigMountOptions {
     }
 }
 
-impl ConfigNet {
-    fn from_input(input: &InputConfigNet) -> Self {
+impl ConfigUnixAddr {
+    fn from_input(input: &InputConfigUnixAddr) -> Self {
         Self {
-            host_paths: input.host_paths.clone(),
+            path_name: input.path_name.clone(),
+            abstract_name: input.abstract_name.clone(),
         }
     }
 }
@@ -311,7 +313,7 @@ struct InputConfig {
     #[serde(default)]
     pub mount: Vec<InputConfigMount>,
     #[serde(default)]
-    pub networking: InputConfigNet,
+    pub host_unix_address: InputConfigUnixAddr,
 }
 
 #[derive(Deserialize, Debug)]
@@ -412,14 +414,16 @@ struct InputConfigMountOptions {
 
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
-struct InputConfigNet {
-    pub host_paths: Vec<String>,
+struct InputConfigUnixAddr {
+    pub path_name: Vec<String>,
+    pub abstract_name: Vec<String>,
 }
 
-impl Default for InputConfigNet {
+impl Default for InputConfigUnixAddr {
     fn default() -> Self {
         Self {
-            host_paths: Vec::new(),
+            path_name: Vec::new(),
+            abstract_name: Vec::new(),
         }
     }
 }

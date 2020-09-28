@@ -60,8 +60,10 @@
             }
         }
     ],
-    "networking": {
-        "host_paths": [
+    "host_unix_address": {
+        "path_name": [
+        ],
+        "abstract_name": [
         ]
     }
 }

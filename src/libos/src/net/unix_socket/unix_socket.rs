@@ -321,8 +321,7 @@ impl Socket for UnixSocket {
         }
 
         debug!(
-            "addr {:?} host_call {} and libos_call {} source {:?}",
-            addr,
+            "host_call {} and libos_call {} source {:?}",
             host_call,
             libos_call,
             self.source()
