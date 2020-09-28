@@ -247,9 +247,6 @@ impl File for StreamUnixSocket {
     }
 }
 
-static SOCKETPAIR_NUM: AtomicUsize = AtomicUsize::new(0);
-const SOCK_PATH_PREFIX: &str = "socketpair_";
-
 impl StreamUnixSocket {
     pub fn new(flags: FileFlags) -> Result<Self> {
         Ok(Self {
@@ -265,29 +262,24 @@ impl StreamUnixSocket {
     }
 
     pub fn socketpair(flags: FileFlags) -> Result<(Self, Self)> {
-        let mut listen_socket = Self::new(flags)?;
-        let bound_path = listen_socket.bind_until_success();
-        listen_socket.listen(1)?;
-        let mut client_socket = Self::new(flags)?;
-        client_socket.connect(Some(bound_path))?;
-        let (accepted_socket, _) = listen_socket.accept(flags, None)?;
-        Ok((client_socket, accepted_socket))
-    }
+        let is_blocking = !flags.contains(FileFlags::SOCK_NONBLOCK);
+        let (channel_a, channel_b) = EndPoint::new_duplex_channel()?;
 
-    fn bind_until_success(&self) -> SockAddr {
-        loop {
-            let sock_path_suffix = SOCKETPAIR_NUM.fetch_add(1, Ordering::SeqCst);
-            let sock_path = format!("{}{}", SOCK_PATH_PREFIX, sock_path_suffix);
-            let addr_un = UnixAddr::new(&sock_path);
-            if addr_un.is_err() {
-                continue;
-            }
+        let socket_a = StreamUnixSocket {
+            path: RwLock::new(None),
+            channel: SgxMutex::new(Some(channel_a)),
+            server: RwLock::new(None),
+            is_blocking: AtomicBool::new(is_blocking),
+        };
 
-            let sock_addr = SockAddr::UnixSocket(addr_un.unwrap());
-            if self.bind(sock_addr).is_ok() {
-                return sock_addr;
-            }
-        }
+        let socket_b = StreamUnixSocket {
+            path: RwLock::new(None),
+            channel: SgxMutex::new(Some(channel_b)),
+            server: RwLock::new(None),
+            is_blocking: AtomicBool::new(is_blocking),
+        };
+
+        Ok((socket_a, socket_b))
     }
 
     pub fn is_connected(&self) -> bool {
